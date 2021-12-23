@@ -14,6 +14,7 @@
 #include "utils/string.h"
 #include "utils/timer.h"
 #include "utils/utils.h"
+#include "soxr.h"
 
 DEFINE_bool(simulate_streaming, false, "simulate streaming input");
 DEFINE_bool(output_nbest, false, "output n-best of decode result");
@@ -56,78 +57,167 @@ int main(int argc, char *argv[]) {
   int total_decode_time = 0;
   for (auto &wav : waves) {
     wenet::WavReader wav_reader(wav.second);
-    CHECK_EQ(wav_reader.sample_rate(), FLAGS_sample_rate);
+    // CHECK_EQ(wav_reader.sample_rate(), FLAGS_sample_rate);
+    if (wav_reader.sample_rate() != FLAGS_sample_rate) {
+      size_t ilen = wav_reader.num_sample();
+      double orate = FLAGS_sample_rate;
+      double irate = wav_reader.sample_rate();
+      size_t olen = (size_t)(ilen * orate / irate + .5);
+      float *out = (float *)malloc(sizeof(*out) * olen);
+      size_t odone;
 
-    auto feature_pipeline =
-        std::make_shared<wenet::FeaturePipeline>(*feature_config);
-    feature_pipeline->AcceptWaveform(std::vector<float>(
-        wav_reader.data(), wav_reader.data() + wav_reader.num_sample()));
-    feature_pipeline->set_input_finished();
-    LOG(INFO) << "num frames " << feature_pipeline->num_frames();
+      soxr_error_t error = soxr_oneshot(irate, orate, 1,
+            wav_reader.data(), ilen, NULL,
+            out, olen, &odone,
+            NULL, NULL, NULL);
+      
+      // wenet::WavWriter wav_writer(out, odone, 1, orate, 16);
+      // wav_writer.Write("test.wav");
 
-    wenet::TorchAsrDecoder decoder(feature_pipeline, decode_resource,
-                                   *decode_config);
+      auto feature_pipeline =
+          std::make_shared<wenet::FeaturePipeline>(*feature_config);
+      feature_pipeline->AcceptWaveform(std::vector<float>(
+          out, out + odone));
+      feature_pipeline->set_input_finished();
+      LOG(INFO) << "num frames " << feature_pipeline->num_frames();
 
-    int wave_dur =
-        static_cast<int>(static_cast<float>(wav_reader.num_sample()) /
-                         wav_reader.sample_rate() * 1000);
-    int decode_time = 0;
-    std::string final_result;
-    while (true) {
-      wenet::Timer timer;
-      wenet::DecodeState state = decoder.Decode();
-      if (state == wenet::DecodeState::kEndFeats) {
-        decoder.Rescoring();
-      }
-      int chunk_decode_time = timer.Elapsed();
-      decode_time += chunk_decode_time;
-      if (decoder.DecodedSomething()) {
-        LOG(INFO) << "Partial result: " << decoder.result()[0].sentence;
-      }
+      wenet::TorchAsrDecoder decoder(feature_pipeline, decode_resource,
+                                    *decode_config);
 
-      if (state == wenet::DecodeState::kEndpoint) {
-        decoder.Rescoring();
-        final_result.append(decoder.result()[0].sentence);
-        decoder.ResetContinuousDecoding();
-      }
+      int wave_dur =
+          static_cast<int>(static_cast<float>(odone) /
+                          orate * 1000);
+      int decode_time = 0;
+      std::string final_result;
+      while (true) {
+        wenet::Timer timer;
+        wenet::DecodeState state = decoder.Decode();
+        if (state == wenet::DecodeState::kEndFeats) {
+          decoder.Rescoring();
+        }
+        int chunk_decode_time = timer.Elapsed();
+        decode_time += chunk_decode_time;
+        if (decoder.DecodedSomething()) {
+          LOG(INFO) << "Partial result: " << decoder.result()[0].sentence;
+        }
 
-      if (state == wenet::DecodeState::kEndFeats) {
-        break;
-      } else if (FLAGS_chunk_size > 0 && FLAGS_simulate_streaming) {
-        float frame_shift_in_ms =
-            static_cast<float>(feature_config->frame_shift) /
-            wav_reader.sample_rate() * 1000;
-        auto wait_time =
-            decoder.num_frames_in_current_chunk() * frame_shift_in_ms -
-            chunk_decode_time;
-        if (wait_time > 0) {
-          LOG(INFO) << "Simulate streaming, waiting for " << wait_time << "ms";
-          std::this_thread::sleep_for(
-              std::chrono::milliseconds(static_cast<int>(wait_time)));
+        if (state == wenet::DecodeState::kEndpoint) {
+          decoder.Rescoring();
+          final_result.append(decoder.result()[0].sentence);
+          decoder.ResetContinuousDecoding();
+        }
+
+        if (state == wenet::DecodeState::kEndFeats) {
+          break;
+        } else if (FLAGS_chunk_size > 0 && FLAGS_simulate_streaming) {
+          float frame_shift_in_ms =
+              static_cast<float>(feature_config->frame_shift) /
+              orate * 1000;
+          auto wait_time =
+              decoder.num_frames_in_current_chunk() * frame_shift_in_ms -
+              chunk_decode_time;
+          if (wait_time > 0) {
+            LOG(INFO) << "Simulate streaming, waiting for " << wait_time << "ms";
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(static_cast<int>(wait_time)));
+          }
         }
       }
-    }
-    if (decoder.DecodedSomething()) {
-      final_result.append(decoder.result()[0].sentence);
-    }
-    LOG(INFO) << wav.first << " Final result: " << final_result << std::endl;
-    LOG(INFO) << "Decoded " << wave_dur << "ms audio taken " << decode_time
-              << "ms.";
-
-    if (!FLAGS_output_nbest) {
-      buffer << wav.first << " " << final_result << std::endl;
-    } else {
-      buffer << "wav " << wav.first << std::endl;
-      auto &results = decoder.result();
-      for (auto &r : results) {
-        if (r.sentence.empty())
-          continue;
-        buffer << "candidate " << r.score << " " << r.sentence << std::endl;
+      if (decoder.DecodedSomething()) {
+        final_result.append(decoder.result()[0].sentence);
       }
-    }
+      LOG(INFO) << wav.first << " Final result: " << final_result << std::endl;
+      LOG(INFO) << "Decoded " << wave_dur << "ms audio taken " << decode_time
+                << "ms.";
 
-    total_waves_dur += wave_dur;
-    total_decode_time += decode_time;
+      if (!FLAGS_output_nbest) {
+        buffer << wav.first << " " << final_result << std::endl;
+      } else {
+        buffer << "wav " << wav.first << std::endl;
+        auto &results = decoder.result();
+        for (auto &r : results) {
+          if (r.sentence.empty())
+            continue;
+          buffer << "candidate " << r.score << " " << r.sentence << std::endl;
+        }
+      }
+
+      total_waves_dur += wave_dur;
+      total_decode_time += decode_time;
+
+      free(out);
+    } else {
+      auto feature_pipeline =
+          std::make_shared<wenet::FeaturePipeline>(*feature_config);
+      feature_pipeline->AcceptWaveform(std::vector<float>(
+          wav_reader.data(), wav_reader.data() + wav_reader.num_sample()));
+      feature_pipeline->set_input_finished();
+      LOG(INFO) << "num frames " << feature_pipeline->num_frames();
+
+      wenet::TorchAsrDecoder decoder(feature_pipeline, decode_resource,
+                                    *decode_config);
+
+      int wave_dur =
+          static_cast<int>(static_cast<float>(wav_reader.num_sample()) /
+                          wav_reader.sample_rate() * 1000);
+      int decode_time = 0;
+      std::string final_result;
+      while (true) {
+        wenet::Timer timer;
+        wenet::DecodeState state = decoder.Decode();
+        if (state == wenet::DecodeState::kEndFeats) {
+          decoder.Rescoring();
+        }
+        int chunk_decode_time = timer.Elapsed();
+        decode_time += chunk_decode_time;
+        if (decoder.DecodedSomething()) {
+          LOG(INFO) << "Partial result: " << decoder.result()[0].sentence;
+        }
+
+        if (state == wenet::DecodeState::kEndpoint) {
+          decoder.Rescoring();
+          final_result.append(decoder.result()[0].sentence);
+          decoder.ResetContinuousDecoding();
+        }
+
+        if (state == wenet::DecodeState::kEndFeats) {
+          break;
+        } else if (FLAGS_chunk_size > 0 && FLAGS_simulate_streaming) {
+          float frame_shift_in_ms =
+              static_cast<float>(feature_config->frame_shift) /
+              wav_reader.sample_rate() * 1000;
+          auto wait_time =
+              decoder.num_frames_in_current_chunk() * frame_shift_in_ms -
+              chunk_decode_time;
+          if (wait_time > 0) {
+            LOG(INFO) << "Simulate streaming, waiting for " << wait_time << "ms";
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(static_cast<int>(wait_time)));
+          }
+        }
+      }
+      if (decoder.DecodedSomething()) {
+        final_result.append(decoder.result()[0].sentence);
+      }
+      LOG(INFO) << wav.first << " Final result: " << final_result << std::endl;
+      LOG(INFO) << "Decoded " << wave_dur << "ms audio taken " << decode_time
+                << "ms.";
+
+      if (!FLAGS_output_nbest) {
+        buffer << wav.first << " " << final_result << std::endl;
+      } else {
+        buffer << "wav " << wav.first << std::endl;
+        auto &results = decoder.result();
+        for (auto &r : results) {
+          if (r.sentence.empty())
+            continue;
+          buffer << "candidate " << r.score << " " << r.sentence << std::endl;
+        }
+      }
+
+      total_waves_dur += wave_dur;
+      total_decode_time += decode_time;
+    }
   }
   LOG(INFO) << "Total: decoded " << total_waves_dur << "ms audio taken "
             << total_decode_time << "ms.";

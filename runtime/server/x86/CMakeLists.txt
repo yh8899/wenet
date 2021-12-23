@@ -125,6 +125,10 @@ else()
 endif()
 include_directories(${openfst_SOURCE_DIR}/src/include)
 
+# libsoxr
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/libsoxr/include)
+link_directories(${CMAKE_CURRENT_SOURCE_DIR}/libsoxr/lib)
+
 # frontend
 add_library(frontend STATIC
   frontend/feature_pipeline.cc
@@ -168,7 +172,7 @@ target_link_libraries(websocket PUBLIC decoder frontend)
 
 # binary
 add_executable(decoder_main bin/decoder_main.cc)
-target_link_libraries(decoder_main PUBLIC frontend decoder)
+target_link_libraries(decoder_main PUBLIC frontend decoder soxr)
 add_executable(websocket_client_main bin/websocket_client_main.cc)
 target_link_libraries(websocket_client_main PUBLIC websocket)
 add_executable(websocket_server_main bin/websocket_server_main.cc)
